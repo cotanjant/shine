@@ -1,0 +1,11 @@
+out/
+build/
+cmake-build-*/
+.vs/
+.cache/
+compile_commands.json
+*.user
+*.suo
+*.pdb
+*.ilk
+*.mp4
