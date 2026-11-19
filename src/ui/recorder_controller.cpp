@@ -1,11 +1,14 @@
 #include "ui/recorder_controller.hpp"
 
+#include "shine/core/clip_library.hpp"
+#include "shine/core/hotkey.hpp"
 #include "shine/core/recorder.hpp"
 #include "shine/service/autostart.hpp"
 
 #include <QCoreApplication>
 #include <QDesktopServices>
 #include <QDir>
+#include <QFileInfo>
 #include <QThread>
 #include <QUrl>
 
@@ -47,22 +50,38 @@ namespace {
     return QStringLiteral("GPU");
 }
 
+[[nodiscard]] QString path_to_qstring(const std::filesystem::path& p) {
+    const std::u8string u8 = p.u8string();
+    return QString::fromUtf8(reinterpret_cast<const char*>(u8.data()), static_cast<qsizetype>(u8.size()));
+}
+
+[[nodiscard]] std::filesystem::path qstring_to_path(const QString& s) {
+    const QByteArray utf8 = s.toUtf8();
+    std::u8string u8(reinterpret_cast<const char8_t*>(utf8.constData()), static_cast<std::size_t>(utf8.size()));
+    return std::filesystem::path(u8);
+}
+
 } // namespace
 
 RecorderController::RecorderController(QObject* parent)
     : QObject(parent),
-      client_(ipc::create_ipc_client(ipc::default_ipc_endpoint())) {
-    const auto recDir = core::default_recordings_dir();
-    outputDirectory_ = QString::fromStdString(recDir.string());
+      client_(ipc::create_ipc_client(ipc::default_ipc_endpoint())),
+      settings_(core::load_settings()) {
+    outputDirectory_ = path_to_qstring(settings_.outputDirectory);
     autostartEnabled_ = service::is_autostart_installed();
+    clipModel_.reload(settings_.outputDirectory);
 
     connect(&pollTimer_, &QTimer::timeout, this, &RecorderController::poll_status);
     pollTimer_.setInterval(2000);
     pollTimer_.start();
 
-    (void)ensure_daemon_running();
-    refreshDisplays();
-    poll_status();
+    if (ensure_daemon_running()) {
+        refreshDisplays();
+        if (settings_.firstRunCompleted) {
+            sync_daemon_replay_and_hotkey();
+        }
+        poll_status();
+    }
 }
 
 std::filesystem::path RecorderController::resolve_daemon_exe() const {
@@ -72,7 +91,7 @@ std::filesystem::path RecorderController::resolve_daemon_exe() const {
 #else
     const QString candidate = QDir(appDir).filePath(QStringLiteral("shine_daemon"));
 #endif
-    return std::filesystem::path(candidate.toStdString());
+    return qstring_to_path(candidate);
 }
 
 bool RecorderController::ensure_daemon_running() {
@@ -111,35 +130,242 @@ bool RecorderController::ensure_daemon_running() {
     return false;
 }
 
+void RecorderController::persist_settings() {
+    auto saveRes = core::save_settings(settings_);
+    if (!saveRes) {
+        lastError_ = QString::fromStdString(saveRes.error().message);
+        emit stateChanged();
+    }
+}
+
+void RecorderController::sync_daemon_replay_and_hotkey() {
+    if (!ensure_daemon_running()) {
+        return;
+    }
+
+    ipc::IpcRequest hkReq{};
+    hkReq.command = ipc::IpcCommand::SetHotkey;
+    hkReq.hotkey = settings_.replayEnabled ? settings_.clipHotkey : std::string{};
+    if (auto hkRes = client_->send(hkReq, 2000); hkRes && !hkRes.value().ok) {
+        lastError_ = QString::fromStdString(hkRes.value().message);
+        emit stateChanged();
+    }
+
+    if (settings_.replayEnabled) {
+        core::ReplayConfig rcfg{};
+        rcfg.displayIndex = settings_.displayIndex;
+        rcfg.fps = settings_.fps;
+        rcfg.bitrateKbps = settings_.bitrateKbps;
+        rcfg.clipLengthSeconds = settings_.clipLengthSeconds;
+        rcfg.captureCursor = settings_.captureCursor;
+        rcfg.preferGpu = true;
+        rcfg.voiceEnabled = settings_.voiceEnabled;
+        rcfg.voicePttEnabled = settings_.voicePttEnabled;
+        rcfg.voicePttHotkey = settings_.voicePttHotkey;
+        rcfg.outputDirectory = settings_.outputDirectory;
+
+        ipc::IpcRequest repReq{};
+        repReq.command = ipc::IpcCommand::ReplayStart;
+        repReq.replayConfig = std::move(rcfg);
+        auto repRes = client_->send(repReq, 5000);
+        if (repRes && repRes.value().ok && repRes.value().stats.has_value()) {
+            apply_stats(*repRes.value().stats);
+        } else if (repRes && !repRes.value().ok) {
+            lastError_ = QString::fromStdString(repRes.value().message);
+            emit stateChanged();
+        }
+    } else {
+        ipc::IpcRequest stopReq{};
+        stopReq.command = ipc::IpcCommand::ReplayStop;
+        auto stopRes = client_->send(stopReq, 3000);
+        if (stopRes && stopRes.value().ok && stopRes.value().stats.has_value()) {
+            apply_stats(*stopRes.value().stats);
+        }
+    }
+}
+
 void RecorderController::setFps(int fps) {
-    const int clamped = std::clamp(fps, 1, 240);
-    if (fps_ != clamped) {
-        fps_ = clamped;
+    const auto clamped = static_cast<std::uint32_t>(std::clamp(fps, 1, 240));
+    if (settings_.fps != clamped) {
+        settings_.fps = clamped;
+        persist_settings();
         emit configChanged();
+        if (settings_.firstRunCompleted && settings_.replayEnabled) {
+            sync_daemon_replay_and_hotkey();
+        }
     }
 }
 
 void RecorderController::setBitrateKbps(int bitrateKbps) {
-    const int clamped = std::clamp(bitrateKbps, 500, 100000);
-    if (bitrateKbps_ != clamped) {
-        bitrateKbps_ = clamped;
+    const auto clamped = static_cast<std::uint32_t>(std::clamp(bitrateKbps, 500, 100000));
+    if (settings_.bitrateKbps != clamped) {
+        settings_.bitrateKbps = clamped;
+        persist_settings();
         emit configChanged();
+        if (settings_.firstRunCompleted && settings_.replayEnabled) {
+            sync_daemon_replay_and_hotkey();
+        }
     }
 }
 
 void RecorderController::setSelectedDisplay(int displayIndex) {
-    const int clamped = std::max(0, displayIndex);
-    if (selectedDisplay_ != clamped) {
-        selectedDisplay_ = clamped;
+    const auto clamped = static_cast<std::uint32_t>(std::max(0, displayIndex));
+    if (settings_.displayIndex != clamped) {
+        settings_.displayIndex = clamped;
+        persist_settings();
         emit configChanged();
+        if (settings_.firstRunCompleted && settings_.replayEnabled) {
+            sync_daemon_replay_and_hotkey();
+        }
     }
 }
 
 void RecorderController::setCaptureCursor(bool enabled) {
-    if (captureCursor_ != enabled) {
-        captureCursor_ = enabled;
+    if (settings_.captureCursor != enabled) {
+        settings_.captureCursor = enabled;
+        persist_settings();
         emit configChanged();
+        if (settings_.firstRunCompleted && settings_.replayEnabled) {
+            sync_daemon_replay_and_hotkey();
+        }
     }
+}
+
+void RecorderController::setClipHotkey(const QString& hotkey) {
+    const auto parsed = core::parse_hotkey(hotkey.toStdString());
+    if (!parsed || !parsed->valid()) {
+        return;
+    }
+    const std::string normalized = parsed->to_string();
+    if (settings_.clipHotkey != normalized) {
+        settings_.clipHotkey = normalized;
+        persist_settings();
+        emit configChanged();
+        if (settings_.firstRunCompleted && settings_.replayEnabled && ensure_daemon_running()) {
+            ipc::IpcRequest hkReq{};
+            hkReq.command = ipc::IpcCommand::SetHotkey;
+            hkReq.hotkey = settings_.clipHotkey;
+            auto res = client_->send(hkReq, 2000);
+            if (res && !res.value().ok) {
+                lastError_ = QString::fromStdString(res.value().message);
+                emit stateChanged();
+            }
+        }
+    }
+}
+
+void RecorderController::setClipLengthSeconds(int seconds) {
+    const auto clamped = static_cast<std::uint32_t>(std::clamp(seconds, 5, 300));
+    if (settings_.clipLengthSeconds != clamped) {
+        settings_.clipLengthSeconds = clamped;
+        persist_settings();
+        emit configChanged();
+        if (settings_.firstRunCompleted && settings_.replayEnabled) {
+            sync_daemon_replay_and_hotkey();
+        }
+    }
+}
+
+void RecorderController::setReplayEnabled(bool enabled) {
+    if (settings_.replayEnabled != enabled) {
+        settings_.replayEnabled = enabled;
+        persist_settings();
+        emit configChanged();
+        if (settings_.firstRunCompleted) {
+            sync_daemon_replay_and_hotkey();
+        }
+    }
+}
+
+void RecorderController::setVoiceEnabled(bool enabled) {
+    if (settings_.voiceEnabled != enabled) {
+        settings_.voiceEnabled = enabled;
+        persist_settings();
+        emit configChanged();
+        if (settings_.firstRunCompleted && settings_.replayEnabled) {
+            sync_daemon_replay_and_hotkey();
+        }
+    }
+}
+
+void RecorderController::setVoicePttEnabled(bool enabled) {
+    if (settings_.voicePttEnabled != enabled) {
+        settings_.voicePttEnabled = enabled;
+        persist_settings();
+        emit configChanged();
+        if (settings_.firstRunCompleted && settings_.replayEnabled && settings_.voiceEnabled) {
+            sync_daemon_replay_and_hotkey();
+        }
+    }
+}
+
+void RecorderController::setVoicePttHotkey(const QString& hotkey) {
+    const auto parsed = core::parse_hotkey(hotkey.toStdString());
+    if (!parsed || !parsed->valid()) {
+        return;
+    }
+    const std::string normalized = parsed->to_string();
+    if (settings_.voicePttHotkey != normalized) {
+        settings_.voicePttHotkey = normalized;
+        persist_settings();
+        emit configChanged();
+        if (settings_.firstRunCompleted && settings_.replayEnabled &&
+            settings_.voiceEnabled && settings_.voicePttEnabled) {
+            sync_daemon_replay_and_hotkey();
+        }
+    }
+}
+
+void RecorderController::completeFirstRun(
+    const QString& hotkey,
+    int clipLengthSeconds,
+    bool voiceEnabled,
+    bool pttEnabled,
+    const QString& pttHotkey) {
+    if (const auto parsed = core::parse_hotkey(hotkey.toStdString()); parsed && parsed->valid()) {
+        settings_.clipHotkey = parsed->to_string();
+    }
+    if (const auto parsedPtt = core::parse_hotkey(pttHotkey.toStdString()); parsedPtt && parsedPtt->valid()) {
+        settings_.voicePttHotkey = parsedPtt->to_string();
+    }
+    settings_.clipLengthSeconds = static_cast<std::uint32_t>(std::clamp(clipLengthSeconds, 5, 300));
+    settings_.voiceEnabled = voiceEnabled;
+    settings_.voicePttEnabled = pttEnabled;
+    settings_.replayEnabled = true;
+    settings_.firstRunCompleted = true;
+
+    persist_settings();
+    emit configChanged();
+    sync_daemon_replay_and_hotkey();
+}
+
+void RecorderController::saveClipNow() {
+    if (!ensure_daemon_running()) {
+        return;
+    }
+
+    ipc::IpcRequest req{};
+    req.command = ipc::IpcCommand::SaveClip;
+    req.clipSeconds = settings_.clipLengthSeconds;
+
+    auto res = client_->send(req, 10000);
+    if (!res) {
+        lastError_ = QString::fromStdString(res.error().message);
+        emit stateChanged();
+        return;
+    }
+    if (!res.value().ok) {
+        lastError_ = QString::fromStdString(res.value().message);
+        emit stateChanged();
+        return;
+    }
+
+    lastError_.clear();
+    if (res.value().stats.has_value()) {
+        apply_stats(*res.value().stats);
+    }
+    refreshClips();
+    emit clipSaved();
 }
 
 void RecorderController::toggleRecording() {
@@ -160,10 +386,10 @@ void RecorderController::toggleRecording() {
     if (!recording_) {
         core::RecordingConfig cfg{};
         cfg.outputPath = core::generate_recording_filename();
-        cfg.displayIndex = static_cast<std::uint32_t>(selectedDisplay_);
-        cfg.fps = static_cast<std::uint32_t>(fps_);
-        cfg.bitrateKbps = static_cast<std::uint32_t>(bitrateKbps_);
-        cfg.captureCursor = captureCursor_;
+        cfg.displayIndex = settings_.displayIndex;
+        cfg.fps = settings_.fps;
+        cfg.bitrateKbps = settings_.bitrateKbps;
+        cfg.captureCursor = settings_.captureCursor;
         cfg.preferGpu = true;
 
         ipc::IpcRequest req{};
@@ -190,6 +416,7 @@ void RecorderController::toggleRecording() {
         } else if (res.value().stats.has_value()) {
             apply_stats(*res.value().stats);
         }
+        refreshClips();
     }
 
     busy_ = false;
@@ -206,13 +433,46 @@ void RecorderController::refreshDisplays() {
     req.command = ipc::IpcCommand::ListDisplays;
     auto res = client_->send(req, 3000);
     if (res && res.value().ok) {
-        const int count = static_cast<int>(res.value().displays.size());
+        const auto count = static_cast<std::uint32_t>(res.value().displays.size());
         displayModel_.set_displays(res.value().displays);
-        if (count > 0 && selectedDisplay_ >= count) {
-            selectedDisplay_ = 0;
+        if (count > 0U && settings_.displayIndex >= count) {
+            settings_.displayIndex = 0U;
+            persist_settings();
             emit configChanged();
         }
     }
+}
+
+void RecorderController::refreshClips() {
+    clipModel_.reload(settings_.outputDirectory);
+}
+
+void RecorderController::openClip(const QString& filePath) {
+    if (!filePath.isEmpty()) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(filePath));
+    }
+}
+
+void RecorderController::revealClip(const QString& filePath) {
+    const QFileInfo fi(filePath);
+    if (fi.exists()) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(fi.absolutePath()));
+    } else {
+        openRecordingsFolder();
+    }
+}
+
+void RecorderController::deleteClip(const QString& filePath) {
+    if (filePath.isEmpty()) {
+        return;
+    }
+    auto res = core::delete_clip(qstring_to_path(filePath));
+    if (!res) {
+        lastError_ = QString::fromStdString(res.error().message);
+        emit stateChanged();
+        return;
+    }
+    refreshClips();
 }
 
 void RecorderController::openRecordingsFolder() {
@@ -251,8 +511,10 @@ void RecorderController::poll_status() {
         if (daemonConnected_) {
             daemonConnected_ = false;
             recording_ = false;
+            replayActive_ = false;
             statusText_ = QStringLiteral("Offline");
             emit stateChanged();
+            emit statsChanged();
         }
         return;
     }
@@ -296,9 +558,21 @@ void RecorderController::apply_stats(const core::RecordingStats& stats) {
     gpuAccelerated_ = stats.gpuAccelerated;
     gpuBadgeText_ = format_gpu_badge(stats.gpuAccelerated, stats.gpuBackend);
     memoryText_ = QStringLiteral("%1 MB").arg(static_cast<int>(std::llround(stats.memoryUsageMb)));
+    replayActive_ = stats.replayActive;
+    replayBufferedSec_ = static_cast<int>(stats.replayBufferedSec);
 
     if (!stats.outputPath.empty() && !isRec) {
-        lastRecordingPath_ = QString::fromStdString(stats.outputPath.string());
+        lastRecordingPath_ = path_to_qstring(stats.outputPath);
+    }
+    if (!stats.lastClipPath.empty()) {
+        lastClipPath_ = path_to_qstring(stats.lastClipPath);
+    }
+    if (stats.clipsSavedCount > clipsSavedCount_) {
+        clipsSavedCount_ = stats.clipsSavedCount;
+        refreshClips();
+        emit clipSaved();
+    } else {
+        clipsSavedCount_ = stats.clipsSavedCount;
     }
     if (!stats.lastError.empty()) {
         lastError_ = QString::fromStdString(stats.lastError);
