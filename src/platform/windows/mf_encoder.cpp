@@ -144,59 +144,6 @@ private:
     std::weak_ptr<PoolState> weakPool_;
 };
 
-[[nodiscard]] core::Result<std::shared_ptr<PoolState>> create_nv12_pool(
-    ID3D11Device* d3dDevice,
-    ID3D11VideoDevice* videoDevice,
-    ID3D11VideoProcessorEnumerator* enumerator,
-    std::uint32_t width,
-    std::uint32_t height) {
-    auto pool = std::make_shared<PoolState>();
-    pool->returnCallback = Microsoft::WRL::Make<PoolReturnCallback>(pool->weak_from_this());
-    pool->slots.resize(kNv12PoolSize);
-
-    D3D11_TEXTURE2D_DESC texDesc{};
-    texDesc.Width = width;
-    texDesc.Height = height;
-    texDesc.MipLevels = 1;
-    texDesc.ArraySize = 1;
-    texDesc.Format = DXGI_FORMAT_NV12;
-    texDesc.SampleDesc.Count = 1;
-    texDesc.SampleDesc.Quality = 0;
-    texDesc.Usage = D3D11_USAGE_DEFAULT;
-    texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-    texDesc.CPUAccessFlags = 0;
-    texDesc.MiscFlags = 0;
-
-    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc{};
-    ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-    ovDesc.Texture2D.MipSlice = 0;
-
-    for (std::size_t i = 0; i < kNv12PoolSize; ++i) {
-        HRESULT hr = d3dDevice->CreateTexture2D(&texDesc, nullptr, &pool->slots[i].texture);
-        if (FAILED(hr)) {
-            return core::Result<std::shared_ptr<PoolState>>::make_err(
-                core::ErrorCode::EncoderInitFailed,
-                "CreateTexture2D(NV12 pool slot) failed: " + hr_to_string(hr));
-        }
-
-        hr = videoDevice->CreateVideoProcessorOutputView(
-            pool->slots[i].texture.Get(),
-            enumerator,
-            &ovDesc,
-            &pool->slots[i].outputView);
-        if (FAILED(hr)) {
-            return core::Result<std::shared_ptr<PoolState>>::make_err(
-                core::ErrorCode::EncoderInitFailed,
-                "CreateVideoProcessorOutputView failed: " + hr_to_string(hr));
-        }
-
-        pool->slots[i].token = Microsoft::WRL::Make<SlotToken>(i);
-        pool->freeIndices.push_back(i);
-    }
-
-    return core::Result<std::shared_ptr<PoolState>>::make_ok(std::move(pool));
-}
-
 [[nodiscard]] core::Result<Microsoft::WRL::ComPtr<IMFSample>> create_dxgi_sample_from_texture(
     ID3D11Texture2D* texture,
     IMFAsyncCallback* returnCallback,
@@ -309,23 +256,232 @@ void bgra_to_nv12_bt709(
 
 } // namespace
 
-MfH264Encoder::~MfH264Encoder() {
-    (void)finalize();
+core::Result<std::shared_ptr<PoolState>> create_nv12_pool(
+    ID3D11Device* d3dDevice,
+    ID3D11VideoDevice* videoDevice,
+    ID3D11VideoProcessorEnumerator* enumerator,
+    std::uint32_t width,
+    std::uint32_t height) {
+    auto pool = std::make_shared<PoolState>();
+    pool->returnCallback = Microsoft::WRL::Make<PoolReturnCallback>(pool->weak_from_this());
+    pool->slots.resize(kNv12PoolSize);
 
-    if (surfacePool_) {
-        std::lock_guard<std::mutex> lock(surfacePool_->mutex);
-        surfacePool_->shuttingDown = true;
+    D3D11_TEXTURE2D_DESC texDesc{};
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_NV12;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.SampleDesc.Quality = 0;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    texDesc.CPUAccessFlags = 0;
+    texDesc.MiscFlags = 0;
+
+    D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc{};
+    ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+    ovDesc.Texture2D.MipSlice = 0;
+
+    for (std::size_t i = 0; i < kNv12PoolSize; ++i) {
+        HRESULT hr = d3dDevice->CreateTexture2D(&texDesc, nullptr, &pool->slots[i].texture);
+        if (FAILED(hr)) {
+            return core::Result<std::shared_ptr<PoolState>>::make_err(
+                core::ErrorCode::EncoderInitFailed,
+                "CreateTexture2D(NV12 pool slot) failed: " + hr_to_string(hr));
+        }
+
+        hr = videoDevice->CreateVideoProcessorOutputView(
+            pool->slots[i].texture.Get(),
+            enumerator,
+            &ovDesc,
+            &pool->slots[i].outputView);
+        if (FAILED(hr)) {
+            return core::Result<std::shared_ptr<PoolState>>::make_err(
+                core::ErrorCode::EncoderInitFailed,
+                "CreateVideoProcessorOutputView failed: " + hr_to_string(hr));
+        }
+
+        pool->slots[i].token = Microsoft::WRL::Make<SlotToken>(i);
+        pool->freeIndices.push_back(i);
     }
 
+    return core::Result<std::shared_ptr<PoolState>>::make_ok(std::move(pool));
+}
+
+void shutdown_nv12_pool(std::shared_ptr<PoolState>& pool) {
+    if (!pool) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(pool->mutex);
+        pool->shuttingDown = true;
+        pool->cv.notify_all();
+    }
+    pool->returnCallback.Reset();
+    pool->slots.clear();
+    pool.reset();
+}
+
+core::Result<Microsoft::WRL::ComPtr<IMFSample>> acquire_converted_nv12_sample(
+    PoolState& pool,
+    D3D11BgraToNv12Converter& converter,
+    std::int64_t sampleTime100Ns,
+    std::int64_t sampleDuration100Ns) {
+    std::optional<std::size_t> slotIdx;
+    {
+        std::unique_lock<std::mutex> lock(pool.mutex);
+        if (pool.freeIndices.empty()) {
+            pool.cv.wait_for(lock, kPoolWaitTimeout, [&]() {
+                return !pool.freeIndices.empty() || pool.shuttingDown;
+            });
+        }
+        if (pool.shuttingDown) {
+            return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_ok({});
+        }
+        if (!pool.freeIndices.empty()) {
+            slotIdx = pool.freeIndices.front();
+            pool.freeIndices.pop_front();
+            ++pool.poolHits;
+        }
+    }
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> targetTex;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> targetOv;
+    IMFAsyncCallback* callback = nullptr;
+    IUnknown* token = nullptr;
+
+    Microsoft::WRL::ComPtr<ID3D11Texture2D> overflowTex;
+    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> overflowOv;
+
+    if (slotIdx.has_value()) {
+        const auto& slot = pool.slots[*slotIdx];
+        targetTex = slot.texture;
+        targetOv = slot.outputView;
+        callback = pool.returnCallback.Get();
+        token = slot.token.Get();
+    } else {
+        Microsoft::WRL::ComPtr<ID3D11Device> dev;
+        pool.slots[0].texture->GetDevice(&dev);
+
+        D3D11_TEXTURE2D_DESC texDesc{};
+        pool.slots[0].texture->GetDesc(&texDesc);
+        HRESULT hr = dev->CreateTexture2D(&texDesc, nullptr, &overflowTex);
+        if (FAILED(hr)) {
+            return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_err(
+                core::ErrorCode::EncodeFailed,
+                "Overflow NV12 texture allocation failed: " + hr_to_string(hr));
+        }
+        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc{};
+        ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
+        hr = converter.video_device()->CreateVideoProcessorOutputView(
+            overflowTex.Get(), converter.enumerator(), &ovDesc, &overflowOv);
+        if (FAILED(hr)) {
+            return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_err(
+                core::ErrorCode::EncodeFailed,
+                "Overflow NV12 output view failed: " + hr_to_string(hr));
+        }
+        targetTex = overflowTex;
+        targetOv = overflowOv;
+        ++pool.overflowAllocations;
+    }
+
+    auto convRes = converter.convert(targetOv.Get());
+    if (!convRes) {
+        if (slotIdx.has_value()) {
+            pool.return_slot(*slotIdx);
+        }
+        return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_err(convRes.error());
+    }
+
+    auto sampleRes = create_dxgi_sample_from_texture(targetTex.Get(), callback, token);
+    if (!sampleRes) {
+        if (slotIdx.has_value()) {
+            pool.return_slot(*slotIdx);
+        }
+        return sampleRes;
+    }
+
+    Microsoft::WRL::ComPtr<IMFSample> sample = sampleRes.take();
+    sample->SetSampleTime(sampleTime100Ns);
+    sample->SetSampleDuration(sampleDuration100Ns);
+    return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_ok(std::move(sample));
+}
+
+core::Result<Microsoft::WRL::ComPtr<IMFSample>> create_cpu_nv12_sample(
+    const DxgiCapture& capture,
+    ID3D11Texture2D* swStagingTex,
+    std::uint32_t encodeWidth,
+    std::uint32_t encodeHeight,
+    std::vector<std::uint8_t>& swNv12Buffer,
+    std::int64_t sampleTime100Ns,
+    std::int64_t sampleDuration100Ns) {
+    if (swStagingTex == nullptr) {
+        return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_err(
+            core::ErrorCode::EncodeFailed, "Null software staging texture");
+    }
+
+    auto copyRes = capture.copy_to_staging(swStagingTex);
+    if (!copyRes) {
+        return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_err(copyRes.error());
+    }
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    HRESULT hr = capture.context()->Map(swStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_err(
+            core::ErrorCode::EncodeFailed,
+            "Map(swStagingTex_) failed: " + hr_to_string(hr));
+    }
+
+    bgra_to_nv12_bt709(
+        static_cast<const std::uint8_t*>(mapped.pData),
+        mapped.RowPitch,
+        encodeWidth,
+        encodeHeight,
+        swNv12Buffer.data());
+
+    capture.context()->Unmap(swStagingTex, 0);
+
+    const DWORD bufSize = static_cast<DWORD>(swNv12Buffer.size());
+    Microsoft::WRL::ComPtr<IMFMediaBuffer> mediaBuffer;
+    hr = ::MFCreateMemoryBuffer(bufSize, &mediaBuffer);
+    if (FAILED(hr)) {
+        return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_err(
+            core::ErrorCode::EncodeFailed,
+            "MFCreateMemoryBuffer failed: " + hr_to_string(hr));
+    }
+
+    BYTE* dstPtr = nullptr;
+    hr = mediaBuffer->Lock(&dstPtr, nullptr, nullptr);
+    if (FAILED(hr)) {
+        return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_err(
+            core::ErrorCode::EncodeFailed,
+            "IMFMediaBuffer::Lock failed: " + hr_to_string(hr));
+    }
+    std::memcpy(dstPtr, swNv12Buffer.data(), bufSize);
+    mediaBuffer->Unlock();
+    mediaBuffer->SetCurrentLength(bufSize);
+
+    Microsoft::WRL::ComPtr<IMFSample> sample;
+    hr = ::MFCreateSample(&sample);
+    if (FAILED(hr)) {
+        return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_err(
+            core::ErrorCode::EncodeFailed,
+            "MFCreateSample failed: " + hr_to_string(hr));
+    }
+    sample->AddBuffer(mediaBuffer.Get());
+    sample->SetSampleTime(sampleTime100Ns);
+    sample->SetSampleDuration(sampleDuration100Ns);
+    return core::Result<Microsoft::WRL::ComPtr<IMFSample>>::make_ok(std::move(sample));
+}
+
+MfH264Encoder::~MfH264Encoder() {
+    (void)finalize();
     sinkWriter_.Reset();
     deviceManager_.Reset();
     swStagingTex_.Reset();
-
-    if (surfacePool_) {
-        surfacePool_->returnCallback.Reset();
-        surfacePool_->slots.clear();
-        surfacePool_.reset();
-    }
+    shutdown_nv12_pool(surfacePool_);
 }
 
 core::Result<void> MfH264Encoder::init(
@@ -600,84 +756,15 @@ core::Result<void> MfH264Encoder::encode_gpu_frame(
             core::ErrorCode::EncodeFailed, "GPU encoder pipeline is not initialized");
     }
 
-    std::optional<std::size_t> slotIdx;
-    {
-        std::unique_lock<std::mutex> lock(surfacePool_->mutex);
-        if (surfacePool_->freeIndices.empty()) {
-            surfacePool_->cv.wait_for(lock, kPoolWaitTimeout, [&]() {
-                return !surfacePool_->freeIndices.empty() || surfacePool_->shuttingDown;
-            });
-        }
-        if (surfacePool_->shuttingDown) {
-            return core::Result<void>::make_ok();
-        }
-        if (!surfacePool_->freeIndices.empty()) {
-            slotIdx = surfacePool_->freeIndices.front();
-            surfacePool_->freeIndices.pop_front();
-            ++surfacePool_->poolHits;
-        }
-    }
-
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> targetTex;
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> targetOv;
-    IMFAsyncCallback* callback = nullptr;
-    IUnknown* token = nullptr;
-
-    // Fallback temporary texture if the async MFT holds all pooled slots simultaneously
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> overflowTex;
-    Microsoft::WRL::ComPtr<ID3D11VideoProcessorOutputView> overflowOv;
-
-    if (slotIdx.has_value()) {
-        const auto& slot = surfacePool_->slots[*slotIdx];
-        targetTex = slot.texture;
-        targetOv = slot.outputView;
-        callback = surfacePool_->returnCallback.Get();
-        token = slot.token.Get();
-    } else {
-        Microsoft::WRL::ComPtr<ID3D11Device> dev;
-        surfacePool_->slots[0].texture->GetDevice(&dev);
-
-        D3D11_TEXTURE2D_DESC texDesc{};
-        surfacePool_->slots[0].texture->GetDesc(&texDesc);
-        HRESULT hr = dev->CreateTexture2D(&texDesc, nullptr, &overflowTex);
-        if (FAILED(hr)) {
-            return core::Result<void>::make_err(
-                core::ErrorCode::EncodeFailed,
-                "Overflow NV12 texture allocation failed: " + hr_to_string(hr));
-        }
-        D3D11_VIDEO_PROCESSOR_OUTPUT_VIEW_DESC ovDesc{};
-        ovDesc.ViewDimension = D3D11_VPOV_DIMENSION_TEXTURE2D;
-        hr = converter.video_device()->CreateVideoProcessorOutputView(
-            overflowTex.Get(), converter.enumerator(), &ovDesc, &overflowOv);
-        if (FAILED(hr)) {
-            return core::Result<void>::make_err(
-                core::ErrorCode::EncodeFailed,
-                "Overflow NV12 output view failed: " + hr_to_string(hr));
-        }
-        targetTex = overflowTex;
-        targetOv = overflowOv;
-        ++surfacePool_->overflowAllocations;
-    }
-
-    auto convRes = converter.convert(targetOv.Get());
-    if (!convRes) {
-        if (slotIdx.has_value()) {
-            surfacePool_->return_slot(*slotIdx);
-        }
-        return convRes;
-    }
-
-    auto sampleRes = create_dxgi_sample_from_texture(targetTex.Get(), callback, token);
+    auto sampleRes = acquire_converted_nv12_sample(
+        *surfacePool_, converter, sampleTime100Ns, sampleDuration100Ns);
     if (!sampleRes) {
-        if (slotIdx.has_value()) {
-            surfacePool_->return_slot(*slotIdx);
-        }
         return core::Result<void>::make_err(sampleRes.error());
     }
-
     Microsoft::WRL::ComPtr<IMFSample> sample = sampleRes.take();
-    sample->SetSampleTime(sampleTime100Ns);
-    sample->SetSampleDuration(sampleDuration100Ns);
+    if (!sample) {
+        return core::Result<void>::make_ok();
+    }
 
     const HRESULT hr = sinkWriter_->WriteSample(videoStreamIndex_, sample.Get());
     if (FAILED(hr)) {
@@ -699,60 +786,20 @@ core::Result<void> MfH264Encoder::encode_cpu_frame(
             core::ErrorCode::EncodeFailed, "Software encoder pipeline is not initialized");
     }
 
-    auto copyRes = capture.copy_to_staging(swStagingTex_.Get());
-    if (!copyRes) {
-        return copyRes;
-    }
-
-    D3D11_MAPPED_SUBRESOURCE mapped{};
-    HRESULT hr = capture.context()->Map(swStagingTex_.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) {
-        return core::Result<void>::make_err(
-            core::ErrorCode::EncodeFailed,
-            "Map(swStagingTex_) failed: " + hr_to_string(hr));
-    }
-
-    bgra_to_nv12_bt709(
-        static_cast<const std::uint8_t*>(mapped.pData),
-        mapped.RowPitch,
+    auto sampleRes = create_cpu_nv12_sample(
+        capture,
+        swStagingTex_.Get(),
         encodeWidth_,
         encodeHeight_,
-        swNv12Buffer_.data());
-
-    capture.context()->Unmap(swStagingTex_.Get(), 0);
-
-    const DWORD bufSize = static_cast<DWORD>(swNv12Buffer_.size());
-    Microsoft::WRL::ComPtr<IMFMediaBuffer> mediaBuffer;
-    hr = ::MFCreateMemoryBuffer(bufSize, &mediaBuffer);
-    if (FAILED(hr)) {
-        return core::Result<void>::make_err(
-            core::ErrorCode::EncodeFailed,
-            "MFCreateMemoryBuffer failed: " + hr_to_string(hr));
+        swNv12Buffer_,
+        sampleTime100Ns,
+        sampleDuration100Ns);
+    if (!sampleRes) {
+        return core::Result<void>::make_err(sampleRes.error());
     }
 
-    BYTE* dstPtr = nullptr;
-    hr = mediaBuffer->Lock(&dstPtr, nullptr, nullptr);
-    if (FAILED(hr)) {
-        return core::Result<void>::make_err(
-            core::ErrorCode::EncodeFailed,
-            "IMFMediaBuffer::Lock failed: " + hr_to_string(hr));
-    }
-    std::memcpy(dstPtr, swNv12Buffer_.data(), bufSize);
-    mediaBuffer->Unlock();
-    mediaBuffer->SetCurrentLength(bufSize);
-
-    Microsoft::WRL::ComPtr<IMFSample> sample;
-    hr = ::MFCreateSample(&sample);
-    if (FAILED(hr)) {
-        return core::Result<void>::make_err(
-            core::ErrorCode::EncodeFailed,
-            "MFCreateSample failed: " + hr_to_string(hr));
-    }
-    sample->AddBuffer(mediaBuffer.Get());
-    sample->SetSampleTime(sampleTime100Ns);
-    sample->SetSampleDuration(sampleDuration100Ns);
-
-    hr = sinkWriter_->WriteSample(videoStreamIndex_, sample.Get());
+    Microsoft::WRL::ComPtr<IMFSample> sample = sampleRes.take();
+    const HRESULT hr = sinkWriter_->WriteSample(videoStreamIndex_, sample.Get());
     if (FAILED(hr)) {
         return core::Result<void>::make_err(
             core::ErrorCode::EncodeFailed,

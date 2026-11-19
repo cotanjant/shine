@@ -19,6 +19,30 @@ namespace shine::platform::win {
 
 struct PoolState;
 
+[[nodiscard]] core::Result<std::shared_ptr<PoolState>> create_nv12_pool(
+    ID3D11Device* d3dDevice,
+    ID3D11VideoDevice* videoDevice,
+    ID3D11VideoProcessorEnumerator* enumerator,
+    std::uint32_t width,
+    std::uint32_t height);
+
+void shutdown_nv12_pool(std::shared_ptr<PoolState>& pool);
+
+[[nodiscard]] core::Result<Microsoft::WRL::ComPtr<IMFSample>> acquire_converted_nv12_sample(
+    PoolState& pool,
+    D3D11BgraToNv12Converter& converter,
+    std::int64_t sampleTime100Ns,
+    std::int64_t sampleDuration100Ns);
+
+[[nodiscard]] core::Result<Microsoft::WRL::ComPtr<IMFSample>> create_cpu_nv12_sample(
+    const DxgiCapture& capture,
+    ID3D11Texture2D* swStagingTex,
+    std::uint32_t encodeWidth,
+    std::uint32_t encodeHeight,
+    std::vector<std::uint8_t>& swNv12Buffer,
+    std::int64_t sampleTime100Ns,
+    std::int64_t sampleDuration100Ns);
+
 class MfH264Encoder {
 public:
     MfH264Encoder() = default;

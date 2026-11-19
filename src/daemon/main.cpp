@@ -127,11 +127,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
                                      : shine::ipc::default_ipc_endpoint();
 
     std::atomic<bool> shutdownPosted{false};
-    shine::daemon::DaemonApp app(endpoint, [msgHwnd, &shutdownPosted]() {
-        if (!shutdownPosted.exchange(true, std::memory_order_acq_rel) && msgHwnd != nullptr) {
-            ::PostMessageW(msgHwnd, WM_CLOSE, 0, 0);
-        }
-    });
+    shine::daemon::DaemonApp app(
+        endpoint,
+        [msgHwnd, &shutdownPosted]() {
+            if (!shutdownPosted.exchange(true, std::memory_order_acq_rel) && msgHwnd != nullptr) {
+                ::PostMessageW(msgHwnd, WM_CLOSE, 0, 0);
+            }
+        },
+        !opts.customEndpoint);
 
     auto startRes = app.start();
     if (!startRes) {
@@ -240,13 +243,16 @@ int main(int argc, char** argv) {
     ::sigaction(SIGINT, &sa, nullptr);
     ::sigaction(SIGTERM, &sa, nullptr);
 
-    shine::daemon::DaemonApp app(activeEndpoint, [&wakeWrite]() {
-        if (wakeWrite.valid()) {
-            const char b = 1;
-            const ssize_t ignored = ::write(wakeWrite.get(), &b, 1);
-            (void)ignored;
-        }
-    });
+    shine::daemon::DaemonApp app(
+        activeEndpoint,
+        [&wakeWrite]() {
+            if (wakeWrite.valid()) {
+                const char b = 1;
+                const ssize_t ignored = ::write(wakeWrite.get(), &b, 1);
+                (void)ignored;
+            }
+        },
+        !customEndpoint);
 
     auto startRes = app.start();
     if (!startRes) {
