@@ -170,6 +170,79 @@ int main() {
                 allOk = false;
             }
         }
+
+        // Exercise Medal-style rolling replay & instant clip saving through daemon IPC.
+        shine::ipc::IpcRequest replayStartReq{};
+        replayStartReq.command = shine::ipc::IpcCommand::ReplayStart;
+        shine::core::ReplayConfig replayCfg{};
+        replayCfg.displayIndex = 0;
+        replayCfg.fps = 30;
+        replayCfg.bitrateKbps = 4000;
+        replayCfg.clipLengthSeconds = 5;
+        replayCfg.outputDirectory = tempDir;
+        replayStartReq.replayConfig = replayCfg;
+
+        auto replayStartRpc = client->send(replayStartReq, 5000);
+        if (!replayStartRpc) {
+            std::cerr << "FAIL: IPC send error for REPLAY_START: " << replayStartRpc.error().message << '\n';
+            allOk = false;
+        } else if (!replayStartRpc.value().ok) {
+#ifdef _WIN32
+            if (is_github_actions() &&
+                replayStartRpc.value().errorCode == shine::core::ErrorCode::CaptureFailed) {
+                std::cout << "Note: skipping daemon replay capture on headless Windows CI ("
+                          << replayStartRpc.value().message << ")\n";
+            } else {
+                std::cerr << "FAIL: REPLAY_START rejected: " << replayStartRpc.value().message << '\n';
+                allOk = false;
+            }
+#else
+            std::cerr << "FAIL: REPLAY_START rejected: " << replayStartRpc.value().message << '\n';
+            allOk = false;
+#endif
+        } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1800));
+
+            const auto clipOutPath = tempDir / "daemon_ipc_clip.mp4";
+            shine::ipc::IpcRequest clipReq{};
+            clipReq.command = shine::ipc::IpcCommand::SaveClip;
+            clipReq.clipOutputPath = clipOutPath;
+            clipReq.clipSeconds = 5;
+
+            shine::ipc::IpcResponse clipResp{};
+            if (!send_checked(clipReq, clipResp) || !clipResp.ok) {
+                std::cerr << "FAIL: SAVE_CLIP failed: " << clipResp.message << '\n';
+                allOk = false;
+            } else {
+                const auto clipReport = shine::core::inspect_mp4(clipOutPath);
+                if (!clipReport.valid || clipReport.videoFrameCount < 3U) {
+                    std::cerr << "FAIL: saved daemon clip MP4 invalid (" << clipReport.diagnostic << ")\n";
+                    allOk = false;
+                }
+            }
+            std::filesystem::remove(clipOutPath, ec);
+
+            shine::ipc::IpcRequest replayStopReq{};
+            replayStopReq.command = shine::ipc::IpcCommand::ReplayStop;
+            shine::ipc::IpcResponse replayStopResp{};
+            if (!send_checked(replayStopReq, replayStopResp) || !replayStopResp.ok) {
+                std::cerr << "FAIL: REPLAY_STOP failed: " << replayStopResp.message << '\n';
+                allOk = false;
+            }
+        }
+
+        {
+            shine::ipc::IpcRequest hotkeyReq{};
+            hotkeyReq.command = shine::ipc::IpcCommand::SetHotkey;
+            hotkeyReq.hotkey = "Ctrl+Shift+F9";
+            shine::ipc::IpcResponse hotkeyResp{};
+            if (!send_checked(hotkeyReq, hotkeyResp) || !hotkeyResp.ok ||
+                !hotkeyResp.stats.has_value() ||
+                hotkeyResp.stats->activeClipHotkey != "Ctrl+Shift+F9") {
+                std::cerr << "FAIL: SET_HOTKEY failed or did not echo Ctrl+Shift+F9\n";
+                allOk = false;
+            }
+        }
     } else {
         std::cout << "Note: no display attached; verified daemon IPC lifecycle without video capture.\n";
     }

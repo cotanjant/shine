@@ -56,6 +56,7 @@ jobs:
             libxfixes-dev \
             libxrandr-dev \
             libva-dev \
+            libasound2-dev \
             libavcodec-dev \
             libavformat-dev \
             libavutil-dev \

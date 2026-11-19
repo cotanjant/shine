@@ -21,7 +21,11 @@ else()
 endif()
 
 set(SHINE_CORE_SOURCES
+    src/core/clip_library.cpp
+    src/core/hotkey.cpp
     src/core/mp4_validator.cpp
+    src/core/replay_buffer.cpp
+    src/core/settings.cpp
     src/ipc/protocol.cpp
 )
 
@@ -30,17 +34,24 @@ if(WIN32)
         src/platform/windows/dxgi_capture.cpp
         src/platform/windows/d3d11_converter.cpp
         src/platform/windows/mf_encoder.cpp
-        src/platform/windows/win_recorder.cpp
-        src/platform/windows/win_ipc.cpp
+        src/platform/windows/mf_replay_encoder.cpp
+        src/platform/windows/win_audio.cpp
         src/platform/windows/win_autostart.cpp
+        src/platform/windows/win_hotkey.cpp
+        src/platform/windows/win_ipc.cpp
+        src/platform/windows/win_recorder.cpp
+        src/platform/windows/win_replay_recorder.cpp
     )
 elseif(UNIX AND NOT APPLE)
     list(APPEND SHINE_CORE_SOURCES
         src/platform/linux/x11_capture.cpp
         src/platform/linux/vaapi_encoder.cpp
-        src/platform/linux/linux_recorder.cpp
-        src/platform/linux/linux_ipc.cpp
+        src/platform/linux/linux_audio.cpp
         src/platform/linux/linux_autostart.cpp
+        src/platform/linux/linux_hotkey.cpp
+        src/platform/linux/linux_ipc.cpp
+        src/platform/linux/linux_recorder.cpp
+        src/platform/linux/linux_replay_recorder.cpp
     )
 else()
     message(FATAL_ERROR "Unsupported platform for shine")
@@ -71,6 +82,7 @@ if(WIN32)
         mfreadwrite
         mfuuid
         mf
+        wmcodecdspuuid
         ole32
         psapi
         user32
@@ -87,6 +99,7 @@ elseif(UNIX AND NOT APPLE)
         xrandr
         libva
         libva-drm
+        alsa
         libavcodec
         libavformat
         libavutil
@@ -126,6 +139,8 @@ if(SHINE_BUILD_UI)
                 src/ui/recorder_controller.hpp
                 src/ui/display_model.cpp
                 src/ui/display_model.hpp
+                src/ui/clip_model.cpp
+                src/ui/clip_model.hpp
                 packaging/windows/shine.rc
             )
         else()
@@ -135,6 +150,8 @@ if(SHINE_BUILD_UI)
                 src/ui/recorder_controller.hpp
                 src/ui/display_model.cpp
                 src/ui/display_model.hpp
+                src/ui/clip_model.cpp
+                src/ui/clip_model.hpp
             )
         endif()
 
@@ -144,6 +161,9 @@ if(SHINE_BUILD_UI)
         set_source_files_properties(qml/components/RecordButton.qml PROPERTIES QT_RESOURCE_ALIAS RecordButton.qml)
         set_source_files_properties(qml/components/StatusBadge.qml PROPERTIES QT_RESOURCE_ALIAS StatusBadge.qml)
         set_source_files_properties(qml/components/DisplaySelector.qml PROPERTIES QT_RESOURCE_ALIAS DisplaySelector.qml)
+        set_source_files_properties(qml/components/HotkeyRecorder.qml PROPERTIES QT_RESOURCE_ALIAS HotkeyRecorder.qml)
+        set_source_files_properties(qml/components/FirstRunWizard.qml PROPERTIES QT_RESOURCE_ALIAS FirstRunWizard.qml)
+        set_source_files_properties(qml/components/ClipsPanel.qml PROPERTIES QT_RESOURCE_ALIAS ClipsPanel.qml)
 
         qt_add_qml_module(shine_app
             URI Shine
@@ -153,6 +173,9 @@ if(SHINE_BUILD_UI)
                 qml/components/RecordButton.qml
                 qml/components/StatusBadge.qml
                 qml/components/DisplaySelector.qml
+                qml/components/HotkeyRecorder.qml
+                qml/components/FirstRunWizard.qml
+                qml/components/ClipsPanel.qml
         )
 
         target_include_directories(shine_app PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
@@ -194,6 +217,7 @@ if(WIN32)
     set(CMAKE_INSTALL_SYSTEM_RUNTIME_DESTINATION "${CMAKE_INSTALL_BINDIR}")
     set(CMAKE_INSTALL_UCRT_LIBRARIES TRUE)
     include(InstallRequiredSystemLibraries)
+    install(FILES LICENSE DESTINATION ".")
 elseif(UNIX AND NOT APPLE)
     set(SHINE_DAEMON_PATH "${CMAKE_INSTALL_FULL_BINDIR}/shine_daemon")
     configure_file(
@@ -213,6 +237,10 @@ elseif(UNIX AND NOT APPLE)
         FILES packaging/linux/shine.svg
         DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/icons/hicolor/scalable/apps"
     )
+    install(
+        FILES LICENSE
+        DESTINATION "${CMAKE_INSTALL_DATAROOTDIR}/doc/shine"
+    )
 endif()
 
 if(SHINE_BUILD_TESTS)
@@ -225,6 +253,10 @@ if(SHINE_BUILD_TESTS)
     add_executable(shine_test_recording tests/test_recording.cpp)
     target_link_libraries(shine_test_recording PRIVATE shine_core shine_warnings)
     add_test(NAME shine_test_recording COMMAND shine_test_recording)
+
+    add_executable(shine_test_replay tests/test_replay.cpp)
+    target_link_libraries(shine_test_replay PRIVATE shine_core shine_warnings)
+    add_test(NAME shine_test_replay COMMAND shine_test_replay)
 
     add_executable(shine_test_daemon_ipc tests/test_daemon_ipc.cpp)
     target_link_libraries(shine_test_daemon_ipc PRIVATE shine_core shine_warnings)
@@ -241,6 +273,7 @@ set(CPACK_PACKAGE_VERSION_MAJOR "${PROJECT_VERSION_MAJOR}")
 set(CPACK_PACKAGE_VERSION_MINOR "${PROJECT_VERSION_MINOR}")
 set(CPACK_PACKAGE_VERSION_PATCH "${PROJECT_VERSION_PATCH}")
 set(CPACK_PACKAGE_INSTALL_DIRECTORY "Shine")
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
 
 if(WIN32)
     set(CPACK_GENERATOR "NSIS;ZIP")
