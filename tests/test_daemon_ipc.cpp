@@ -3,14 +3,36 @@
 #include "shine/service/autostart.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 
 #ifndef SHINE_DAEMON_PATH
 #error "SHINE_DAEMON_PATH must be defined by CMake"
 #endif
+
+namespace {
+
+[[nodiscard]] bool is_github_actions() noexcept {
+#ifdef _WIN32
+    char* val = nullptr;
+    std::size_t len = 0;
+    if (_dupenv_s(&val, &len, "GITHUB_ACTIONS") == 0 && val != nullptr) {
+        std::unique_ptr<char, decltype(&std::free)> guard(val, &std::free);
+        return std::string_view(guard.get()) == "true";
+    }
+    return false;
+#else
+    const char* val = std::getenv("GITHUB_ACTIONS");
+    return val != nullptr && std::string_view(val) == "true";
+#endif
+}
+
+} // namespace
 
 int main() {
     const auto nowTicks = std::chrono::steady_clock::now().time_since_epoch().count();
@@ -91,9 +113,23 @@ int main() {
         cfg.captureCursor = true;
         cfg.preferGpu = true;
 
-        shine::ipc::IpcResponse startResp{};
-        if (!send_checked({shine::ipc::IpcCommand::Start, cfg}, startResp)) {
+        auto startRpc = client->send({shine::ipc::IpcCommand::Start, cfg}, 5000);
+        if (!startRpc) {
+            std::cerr << "FAIL: IPC send error: " << startRpc.error().message << '\n';
             allOk = false;
+        } else if (!startRpc.value().ok) {
+#ifdef _WIN32
+            if (is_github_actions() && startRpc.value().errorCode == shine::core::ErrorCode::CaptureFailed) {
+                std::cout << "SKIP capture portion in daemon test: headless Windows CI runner without DXGI duplication ("
+                          << startRpc.value().message << ")\n";
+            } else {
+                std::cerr << "FAIL: daemon returned error: " << startRpc.value().message << '\n';
+                allOk = false;
+            }
+#else
+            std::cerr << "FAIL: daemon returned error: " << startRpc.value().message << '\n';
+            allOk = false;
+#endif
         } else {
             std::this_thread::sleep_for(std::chrono::milliseconds(400));
 

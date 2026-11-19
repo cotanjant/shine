@@ -19,6 +19,18 @@ namespace {
     return endpoint;
 }
 
+[[nodiscard]] platform::win::UniqueHandle create_pipe_instance(const std::wstring& widePipe) {
+    return platform::win::UniqueHandle(::CreateNamedPipeW(
+        widePipe.c_str(),
+        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+        PIPE_UNLIMITED_INSTANCES,
+        32768,
+        32768,
+        0,
+        nullptr));
+}
+
 class WinPipeServer final : public IpcServer {
 public:
     explicit WinPipeServer(std::string endpoint)
@@ -77,20 +89,14 @@ private:
             return;
         }
 
+        platform::win::UniqueHandle pipe = create_pipe_instance(widePipe);
         while (!stopRequested_.load(std::memory_order_acquire)) {
-            platform::win::UniqueHandle pipe(::CreateNamedPipeW(
-                widePipe.c_str(),
-                PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                PIPE_UNLIMITED_INSTANCES,
-                32768,
-                32768,
-                0,
-                nullptr));
-
             if (!pipe.valid()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(50));
-                continue;
+                pipe = create_pipe_instance(widePipe);
+                if (!pipe.valid()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                    continue;
+                }
             }
 
             ::ResetEvent(connectEvent.get());
@@ -109,13 +115,16 @@ private:
                     }
                     if (waitRes != WAIT_OBJECT_0 + 1) {
                         ::CancelIo(pipe.get());
+                        pipe.reset();
                         continue;
                     }
                     DWORD dummy = 0;
                     if (!::GetOverlappedResult(pipe.get(), &ov, &dummy, FALSE)) {
+                        pipe.reset();
                         continue;
                     }
                 } else if (err != ERROR_PIPE_CONNECTED) {
+                    pipe.reset();
                     continue;
                 }
             }
@@ -125,9 +134,11 @@ private:
                 break;
             }
 
+            platform::win::UniqueHandle nextPipe = create_pipe_instance(widePipe);
             handle_client(pipe.get());
             ::FlushFileBuffers(pipe.get());
             ::DisconnectNamedPipe(pipe.get());
+            pipe = std::move(nextPipe);
         }
 
         running_.store(false, std::memory_order_release);

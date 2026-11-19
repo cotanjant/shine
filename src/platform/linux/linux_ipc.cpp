@@ -2,6 +2,7 @@
 
 #include "platform/linux/linux_raii.hpp"
 
+#include <atomic>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>

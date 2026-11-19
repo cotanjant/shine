@@ -51,7 +51,7 @@ struct MonitorGeom {
                 g.height = static_cast<std::uint32_t>(monitors[i].height);
                 g.refreshHz = 60;
                 g.isPrimary = (monitors[i].primary != 0);
-                if (monitors[i].name != None) {
+                if (monitors[i].name != kX11None) {
                     char* atomName = ::XGetAtomName(dpy, monitors[i].name);
                     if (atomName != nullptr) {
                         g.name = atomName;

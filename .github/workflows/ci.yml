@@ -34,7 +34,6 @@ jobs:
           host: 'windows'
           target: 'desktop'
           arch: 'win64_msvc2022_64'
-          modules: 'qtdeclarative'
 
       - name: Install Linux Dependencies
         if: runner.os == 'Linux'
@@ -63,7 +62,7 @@ jobs:
 
       - name: Configure (Windows)
         if: runner.os == 'Windows'
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DSHINE_REQUIRE_UI=ON
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_PREFIX_PATH="${{ env.Qt6_DIR }}" -DSHINE_REQUIRE_UI=ON
 
       - name: Configure (Linux)
         if: runner.os == 'Linux'

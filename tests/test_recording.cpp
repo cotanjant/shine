@@ -2,9 +2,31 @@
 #include "shine/core/recorder.hpp"
 
 #include <chrono>
+#include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <memory>
+#include <string_view>
 #include <thread>
+
+namespace {
+
+[[nodiscard]] bool is_github_actions() noexcept {
+#ifdef _WIN32
+    char* val = nullptr;
+    std::size_t len = 0;
+    if (_dupenv_s(&val, &len, "GITHUB_ACTIONS") == 0 && val != nullptr) {
+        std::unique_ptr<char, decltype(&std::free)> guard(val, &std::free);
+        return std::string_view(guard.get()) == "true";
+    }
+    return false;
+#else
+    const char* val = std::getenv("GITHUB_ACTIONS");
+    return val != nullptr && std::string_view(val) == "true";
+#endif
+}
+
+} // namespace
 
 int main() {
     auto dispRes = shine::core::enumerate_displays();
@@ -43,6 +65,14 @@ int main() {
     auto recorder = shine::core::create_screen_recorder();
     auto startRes = recorder->start(cfg);
     if (!startRes) {
+#ifdef _WIN32
+        if (is_github_actions() && startRes.error().code == shine::core::ErrorCode::CaptureFailed) {
+            std::cout << "SKIP shine_test_recording: headless Windows CI runner without DXGI duplication ("
+                      << startRes.error().message << ")\n";
+            std::filesystem::remove_all(tempDir, ec);
+            return 0;
+        }
+#endif
         std::cerr << "FAIL: start() failed: " << startRes.error().message << '\n';
         return 1;
     }

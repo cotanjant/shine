@@ -1,6 +1,7 @@
 #pragma once
 
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <X11/extensions/XShm.h>
 #include <fcntl.h>
 #include <sys/ipc.h>
@@ -8,6 +9,10 @@
 #include <unistd.h>
 #include <va/va.h>
 #include <va/va_drm.h>
+
+#ifdef None
+#undef None
+#endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -23,6 +28,8 @@ extern "C" {
 #include <string>
 
 namespace shine::platform::linux_impl {
+
+inline constexpr unsigned long kX11None = 0UL;
 
 class UniqueFd {
 public:
