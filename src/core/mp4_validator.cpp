@@ -86,6 +86,7 @@ struct BoxHeader {
 
 struct TrackParseState {
     bool isVideoTrack{false};
+    bool isAudioTrack{false};
     std::uint32_t sampleCount{0};
     std::string codecFourCC;
 };
@@ -123,7 +124,12 @@ void parse_container(
         } else if (type_eq(box.type, "trak")) {
             TrackParseState trakState{};
             parse_container(in, payloadOffset, payloadEnd, depth + 1, report, &trakState);
-            if (trakState.isVideoTrack || (report.videoCodecFourCC.empty() && !trakState.codecFourCC.empty())) {
+            if (trakState.isAudioTrack) {
+                report.hasAudioTrack = true;
+                if (!trakState.codecFourCC.empty()) {
+                    report.audioCodecFourCC = trakState.codecFourCC;
+                }
+            } else if (trakState.isVideoTrack || (report.videoCodecFourCC.empty() && !trakState.codecFourCC.empty())) {
                 if (!trakState.codecFourCC.empty()) {
                     report.videoCodecFourCC = trakState.codecFourCC;
                 }
@@ -166,6 +172,8 @@ void parse_container(
                 if (in.gcount() == 12) {
                     if (hdlr[8] == 'v' && hdlr[9] == 'i' && hdlr[10] == 'd' && hdlr[11] == 'e') {
                         currentTrack->isVideoTrack = true;
+                    } else if (hdlr[8] == 's' && hdlr[9] == 'o' && hdlr[10] == 'u' && hdlr[11] == 'n') {
+                        currentTrack->isAudioTrack = true;
                     }
                 }
             }

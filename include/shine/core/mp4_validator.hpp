@@ -18,6 +18,8 @@ struct Mp4Report {
     double durationSeconds{0.0};
     std::uint32_t videoFrameCount{0};
     std::string videoCodecFourCC;
+    bool hasAudioTrack{false};
+    std::string audioCodecFourCC;
     std::string diagnostic;
 };
 

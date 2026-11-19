@@ -19,12 +19,20 @@ enum class IpcCommand {
     ListDisplays,
     Start,
     Stop,
-    Shutdown
+    Shutdown,
+    ReplayStart,
+    ReplayStop,
+    SaveClip,
+    SetHotkey
 };
 
 struct IpcRequest {
     IpcCommand command{IpcCommand::Ping};
     std::optional<core::RecordingConfig> startConfig;
+    std::optional<core::ReplayConfig> replayConfig;
+    std::optional<std::string> hotkey;
+    std::optional<std::filesystem::path> clipOutputPath;
+    std::optional<std::uint32_t> clipSeconds;
 };
 
 struct IpcResponse {

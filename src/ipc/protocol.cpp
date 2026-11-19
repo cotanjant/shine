@@ -216,6 +216,37 @@ std::string serialize_request(const IpcRequest& req) {
     case IpcCommand::Shutdown:
         oss << "SHUTDOWN";
         break;
+    case IpcCommand::ReplayStart: {
+        const core::ReplayConfig rcfg = req.replayConfig.value_or(core::ReplayConfig{});
+        oss << "REPLAY_START"
+            << " output_dir=" << encode_token(path_to_utf8(rcfg.outputDirectory))
+            << " display=" << rcfg.displayIndex
+            << " fps=" << rcfg.fps
+            << " bitrate=" << rcfg.bitrateKbps
+            << " clip_len=" << rcfg.clipLengthSeconds
+            << " cursor=" << (rcfg.captureCursor ? 1 : 0)
+            << " gpu=" << (rcfg.preferGpu ? 1 : 0)
+            << " voice=" << (rcfg.voiceEnabled ? 1 : 0)
+            << " ptt=" << (rcfg.voicePttEnabled ? 1 : 0)
+            << " ptt_key=" << encode_token(rcfg.voicePttHotkey);
+        break;
+    }
+    case IpcCommand::ReplayStop:
+        oss << "REPLAY_STOP";
+        break;
+    case IpcCommand::SaveClip:
+        oss << "SAVE_CLIP";
+        if (req.clipOutputPath.has_value()) {
+            oss << " output=" << encode_token(path_to_utf8(*req.clipOutputPath));
+        }
+        if (req.clipSeconds.has_value()) {
+            oss << " seconds=" << *req.clipSeconds;
+        }
+        break;
+    case IpcCommand::SetHotkey:
+        oss << "SET_HOTKEY"
+            << " hotkey=" << encode_token(req.hotkey.value_or(std::string{}));
+        break;
     }
     oss << '\n';
     return oss.str();
@@ -254,6 +285,117 @@ core::Result<IpcRequest> parse_request(std::string_view line) {
     }
     if (cmd == "SHUTDOWN") {
         req.command = IpcCommand::Shutdown;
+        return core::Result<IpcRequest>::make_ok(std::move(req));
+    }
+    if (cmd == "REPLAY_STOP") {
+        req.command = IpcCommand::ReplayStop;
+        return core::Result<IpcRequest>::make_ok(std::move(req));
+    }
+    if (cmd == "REPLAY_START") {
+        auto kvRes = parse_kv_tokens(tokens, 1);
+        if (!kvRes) {
+            return core::Result<IpcRequest>::make_err(kvRes.error());
+        }
+        const auto& kv = kvRes.value();
+
+        core::ReplayConfig rcfg{};
+        if (auto it = kv.find("output_dir"); it != kv.end() && !it->second.empty()) {
+            auto d = decode_token(it->second);
+            if (!d) {
+                return core::Result<IpcRequest>::make_err(d.error());
+            }
+            rcfg.outputDirectory = utf8_to_path(d.value());
+        }
+        if (auto it = kv.find("display"); it != kv.end()) {
+            auto r = parse_int<std::uint32_t>(it->second);
+            if (!r) {
+                return core::Result<IpcRequest>::make_err(r.error());
+            }
+            rcfg.displayIndex = r.value();
+        }
+        if (auto it = kv.find("fps"); it != kv.end()) {
+            auto r = parse_int<std::uint32_t>(it->second);
+            if (!r) {
+                return core::Result<IpcRequest>::make_err(r.error());
+            }
+            rcfg.fps = r.value();
+        }
+        if (auto it = kv.find("bitrate"); it != kv.end()) {
+            auto r = parse_int<std::uint32_t>(it->second);
+            if (!r) {
+                return core::Result<IpcRequest>::make_err(r.error());
+            }
+            rcfg.bitrateKbps = r.value();
+        }
+        if (auto it = kv.find("clip_len"); it != kv.end()) {
+            auto r = parse_int<std::uint32_t>(it->second);
+            if (!r) {
+                return core::Result<IpcRequest>::make_err(r.error());
+            }
+            rcfg.clipLengthSeconds = r.value();
+        }
+        if (auto it = kv.find("cursor"); it != kv.end()) {
+            rcfg.captureCursor = (it->second != "0");
+        }
+        if (auto it = kv.find("gpu"); it != kv.end()) {
+            rcfg.preferGpu = (it->second != "0");
+        }
+        if (auto it = kv.find("voice"); it != kv.end()) {
+            rcfg.voiceEnabled = (it->second != "0");
+        }
+        if (auto it = kv.find("ptt"); it != kv.end()) {
+            rcfg.voicePttEnabled = (it->second != "0");
+        }
+        if (auto it = kv.find("ptt_key"); it != kv.end() && !it->second.empty()) {
+            auto d = decode_token(it->second);
+            if (!d) {
+                return core::Result<IpcRequest>::make_err(d.error());
+            }
+            rcfg.voicePttHotkey = d.take();
+        }
+
+        req.command = IpcCommand::ReplayStart;
+        req.replayConfig = std::move(rcfg);
+        return core::Result<IpcRequest>::make_ok(std::move(req));
+    }
+    if (cmd == "SAVE_CLIP") {
+        auto kvRes = parse_kv_tokens(tokens, 1);
+        if (!kvRes) {
+            return core::Result<IpcRequest>::make_err(kvRes.error());
+        }
+        const auto& kv = kvRes.value();
+
+        req.command = IpcCommand::SaveClip;
+        if (auto it = kv.find("output"); it != kv.end() && !it->second.empty()) {
+            auto d = decode_token(it->second);
+            if (!d) {
+                return core::Result<IpcRequest>::make_err(d.error());
+            }
+            req.clipOutputPath = utf8_to_path(d.value());
+        }
+        if (auto it = kv.find("seconds"); it != kv.end()) {
+            auto r = parse_int<std::uint32_t>(it->second);
+            if (!r) {
+                return core::Result<IpcRequest>::make_err(r.error());
+            }
+            req.clipSeconds = r.value();
+        }
+        return core::Result<IpcRequest>::make_ok(std::move(req));
+    }
+    if (cmd == "SET_HOTKEY") {
+        auto kvRes = parse_kv_tokens(tokens, 1);
+        if (!kvRes) {
+            return core::Result<IpcRequest>::make_err(kvRes.error());
+        }
+        const auto& kv = kvRes.value();
+        req.command = IpcCommand::SetHotkey;
+        if (auto it = kv.find("hotkey"); it != kv.end()) {
+            auto d = decode_token(it->second);
+            if (!d) {
+                return core::Result<IpcRequest>::make_err(d.error());
+            }
+            req.hotkey = d.take();
+        }
         return core::Result<IpcRequest>::make_ok(std::move(req));
     }
     if (cmd == "START") {
@@ -350,7 +492,13 @@ std::string serialize_response(const IpcResponse& resp) {
             << " backend=" << core::to_string(st.gpuBackend)
             << " encoder=" << encode_token(st.encoderName)
             << " output=" << encode_token(path_to_utf8(st.outputPath))
-            << " last_error=" << encode_token(st.lastError);
+            << " last_error=" << encode_token(st.lastError)
+            << " replay=" << (st.replayActive ? 1 : 0)
+            << " buf_sec=" << st.replayBufferedSec
+            << " voice=" << (st.voiceActive ? 1 : 0)
+            << " hotkey=" << encode_token(st.activeClipHotkey)
+            << " last_clip=" << encode_token(path_to_utf8(st.lastClipPath))
+            << " clips=" << st.clipsSavedCount;
         oss << '\n';
         return oss.str();
     }
@@ -514,6 +662,32 @@ core::Result<IpcResponse> parse_response(std::string_view line) {
         if (auto it = kv.find("last_error"); it != kv.end()) {
             if (auto d = decode_token(it->second); d) {
                 st.lastError = d.take();
+            }
+        }
+        if (auto it = kv.find("replay"); it != kv.end()) {
+            st.replayActive = (it->second != "0");
+        }
+        if (auto it = kv.find("buf_sec"); it != kv.end()) {
+            if (auto r = parse_int<std::uint32_t>(it->second); r) {
+                st.replayBufferedSec = r.value();
+            }
+        }
+        if (auto it = kv.find("voice"); it != kv.end()) {
+            st.voiceActive = (it->second != "0");
+        }
+        if (auto it = kv.find("hotkey"); it != kv.end()) {
+            if (auto d = decode_token(it->second); d) {
+                st.activeClipHotkey = d.take();
+            }
+        }
+        if (auto it = kv.find("last_clip"); it != kv.end()) {
+            if (auto d = decode_token(it->second); d) {
+                st.lastClipPath = utf8_to_path(d.value());
+            }
+        }
+        if (auto it = kv.find("clips"); it != kv.end()) {
+            if (auto r = parse_int<std::uint64_t>(it->second); r) {
+                st.clipsSavedCount = r.value();
             }
         }
 

@@ -115,6 +115,32 @@ struct RecordingConfig {
     }
 };
 
+struct ReplayConfig {
+    std::uint32_t displayIndex{0};
+    std::uint32_t fps{60};
+    std::uint32_t bitrateKbps{8000};
+    std::uint32_t clipLengthSeconds{30};
+    bool captureCursor{true};
+    bool preferGpu{true};
+    bool voiceEnabled{false};
+    bool voicePttEnabled{false};
+    std::string voicePttHotkey{"V"};
+    std::filesystem::path outputDirectory;
+
+    [[nodiscard]] Result<void> validate() const {
+        if (fps < 1 || fps > 240) {
+            return Result<void>::make_err(ErrorCode::InvalidArgument, "FPS must be between 1 and 240");
+        }
+        if (bitrateKbps < 500 || bitrateKbps > 100000) {
+            return Result<void>::make_err(ErrorCode::InvalidArgument, "Bitrate must be between 500 and 100000 kbps");
+        }
+        if (clipLengthSeconds < 5 || clipLengthSeconds > 300) {
+            return Result<void>::make_err(ErrorCode::InvalidArgument, "Clip length must be between 5 and 300 seconds");
+        }
+        return Result<void>::make_ok();
+    }
+};
+
 struct RecordingStats {
     RecorderState state{RecorderState::Idle};
     std::uint64_t elapsedMs{0};
@@ -127,6 +153,12 @@ struct RecordingStats {
     std::string encoderName;
     std::filesystem::path outputPath;
     std::string lastError;
+    bool replayActive{false};
+    std::uint32_t replayBufferedSec{0};
+    bool voiceActive{false};
+    std::string activeClipHotkey;
+    std::filesystem::path lastClipPath;
+    std::uint64_t clipsSavedCount{0};
 };
 
 } // namespace shine::core
