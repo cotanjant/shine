@@ -15,10 +15,10 @@
 #error "SHINE_DAEMON_PATH must be defined by CMake"
 #endif
 
+#ifdef _WIN32
 namespace {
 
 [[nodiscard]] bool is_github_actions() noexcept {
-#ifdef _WIN32
     char* val = nullptr;
     std::size_t len = 0;
     if (_dupenv_s(&val, &len, "GITHUB_ACTIONS") == 0 && val != nullptr) {
@@ -26,13 +26,10 @@ namespace {
         return std::string_view(guard.get()) == "true";
     }
     return false;
-#else
-    const char* val = std::getenv("GITHUB_ACTIONS");
-    return val != nullptr && std::string_view(val) == "true";
-#endif
 }
 
 } // namespace
+#endif
 
 int main() {
     const auto nowTicks = std::chrono::steady_clock::now().time_since_epoch().count();

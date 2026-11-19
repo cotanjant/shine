@@ -2,8 +2,17 @@ name: Shine Cross-Platform CI
 
 on:
   push:
+    branches:
+      - main
+    tags:
+      - 'v*'
   pull_request:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional tag to publish a GitHub Release (e.g. v0.1.0)'
+        required: false
+        default: ''
 
 jobs:
   build-and-test:
@@ -112,3 +121,45 @@ jobs:
         with:
           name: shine-linux-deb
           path: build/packages/*.deb
+
+  release:
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download Windows Installers
+        uses: actions/download-artifact@v4
+        with:
+          name: shine-windows-installer
+          path: release-assets
+
+      - name: Download Linux Installer
+        uses: actions/download-artifact@v4
+        with:
+          name: shine-linux-deb
+          path: release-assets
+
+      - name: Generate SHA256 Checksums
+        run: |
+          (cd release-assets && sha256sum * > /tmp/SHA256SUMS.txt)
+          mv /tmp/SHA256SUMS.txt release-assets/SHA256SUMS.txt
+          ls -lh release-assets
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || inputs.release_tag }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" release-assets/* \
+              --title "Shine $TAG" \
+              --generate-notes
+          fi

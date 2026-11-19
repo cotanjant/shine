@@ -203,7 +203,7 @@ elseif(UNIX AND NOT APPLE)
     )
     install(
         FILES "${CMAKE_CURRENT_BINARY_DIR}/shine-daemon.service"
-        DESTINATION "${CMAKE_INSTALL_LIBDIR}/systemd/user"
+        DESTINATION "lib/systemd/user"
     )
     install(
         FILES packaging/linux/shine.desktop
