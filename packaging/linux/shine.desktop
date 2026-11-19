@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=Shine
+Comment=Minimalist GPU-accelerated offline screen recorder
+Exec=shine
+Icon=shine
+Terminal=false
+Type=Application
+Categories=AudioVideo;Recorder;Utility;
+StartupNotify=true

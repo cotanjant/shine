@@ -1,0 +1,12 @@
+[Unit]
+Description=Shine Screen Recorder Background Service
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@SHINE_DAEMON_PATH@
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target
