@@ -20,7 +20,7 @@ language: C++ and qml+qt for ui
 - [x] Working screen recording
 - [x] Low memory usage
 - [x] GPU acceleration while recording screen(make this unique for each platform)
-- [ ] Minimalist GUI (But do not make it look ass)
+- [x] Minimalist GUI (But do not make it look ass)
 - [x] Stably working background service
 - [x] Offline working
-- [ ] Cross-platform
+- [x] Cross-platform
